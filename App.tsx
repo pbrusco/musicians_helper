@@ -1,14 +1,13 @@
 
-
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import * as Tone from 'tone';
 import { Controls } from './components/Controls';
 import { MeasureGrid } from './components/MeasureGrid';
 import { GuitarTuner } from './components/GuitarTuner';
-import { AudioState, LoadingState, ProcessingParams, LoopState, Measure, GridConfig, Marker, RegionSelection, ProjectMeta } from './types';
+import { AudioState, LoadingState, ProcessingParams, Measure, GridConfig, Marker, RegionSelection, ProjectMeta } from './types';
 import { GRAIN_SIZE, OVERLAP } from './constants';
 import { WaveformTimeline } from './components/WaveformTimeline';
-import { saveAudioToDB, loadAudioFromDB, saveStateToDB, loadStateFromDB, clearDB, getProjects, saveProjectMeta, deleteProject } from './utils/storage';
+import { ConfirmationModal, AlertModal } from './components/Modals';
 
 type GrainPlayerType = Tone.GrainPlayer;
 
@@ -18,12 +17,26 @@ interface HistoryState {
     markers: Marker[];
 }
 
+// In-memory cache for tabs so we don't lose data when switching
+interface CachedProjectData {
+    measures: Measure[];
+    gridConfig: GridConfig;
+    markers: Marker[];
+    params: ProcessingParams;
+    history: HistoryState[];
+    historyIndex: number;
+    // Audio Data
+    audioBuffer: Tone.ToneAudioBuffer | null;
+    audioFileName: string;
+    audioUrl: string | null;
+    audioDuration: number;
+}
+
 const NOTES_SHARP = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
 const NOTES_FLAT  = ['C', 'Db', 'D', 'Eb', 'E', 'F', 'Gb', 'G', 'Ab', 'A', 'Bb', 'B'];
 
 // Helper to convert circle of fifths to key string
 const fifthsToKey = (fifths: number, mode: string = 'major'): string => {
-    // Circle of fifths map for Major keys
     const majorKeys: {[key: number]: string} = {
         0: 'C', 1: 'G', 2: 'D', 3: 'A', 4: 'E', 5: 'B', 6: 'F#', 7: 'C#',
         [-1]: 'F', [-2]: 'Bb', [-3]: 'Eb', [-4]: 'Ab', [-5]: 'Db', [-6]: 'Gb', [-7]: 'Cb'
@@ -31,7 +44,6 @@ const fifthsToKey = (fifths: number, mode: string = 'major'): string => {
 
     let key = majorKeys[fifths] || 'C';
     
-    // If minor mode, convert relative major to minor
     if (mode === 'minor') {
        let idx = NOTES_SHARP.indexOf(key);
        if (idx === -1) idx = NOTES_FLAT.indexOf(key);
@@ -74,9 +86,17 @@ const App: React.FC = () => {
   const [statusMessage, setStatusMessage] = useState('');
   const [saveStatus, setSaveStatus] = useState<'saved' | 'saving' | 'dirty'>('saved');
   
-  // Projects System
+  // Projects System (Memory Only)
   const [projects, setProjects] = useState<ProjectMeta[]>([]);
   const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
+  const [showNewProjectModal, setShowNewProjectModal] = useState(true);
+  
+  // Modals
+  const [confirmationModal, setConfirmationModal] = useState<{ isOpen: boolean; message: string; onConfirm: () => void; onCancel: () => void } | null>(null);
+  const [alertModal, setAlertModal] = useState<{ isOpen: boolean; message: string; onClose: () => void } | null>(null);
+
+  // Cache to hold state of inactive tabs
+  const projectCache = useRef<Record<string, CachedProjectData>>({});
 
   const [audioState, setAudioState] = useState<AudioState>({
     url: null,
@@ -94,14 +114,7 @@ const App: React.FC = () => {
     volume: -5,
     eqLow: 0,
     eqMid: 0,
-    eqHigh: 0,
-    metronomeVolume: -10
-  });
-
-  const [loopState, setLoopState] = useState<LoopState>({
-    active: false,
-    start: null,
-    end: null
+    eqHigh: 0
   });
 
   const [selection, setSelection] = useState<RegionSelection>({
@@ -112,13 +125,11 @@ const App: React.FC = () => {
 
   const [selectedMeasureIndices, setSelectedMeasureIndices] = useState<number[]>([]);
 
-  const [isMetronomeOn, setIsMetronomeOn] = useState(false);
   const [showTuner, setShowTuner] = useState(false);
   const [autoScroll, setAutoScroll] = useState(true);
   const [isDragging, setIsDragging] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [isCompactMode, setIsCompactMode] = useState(false);
-  const [restoring, setRestoring] = useState(true);
 
   // -- Composition (Grid) Data --
   const [gridConfig, setGridConfig] = useState<GridConfig>({
@@ -143,16 +154,19 @@ const App: React.FC = () => {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const jsonInputRef = useRef<HTMLInputElement>(null);
   const xmlInputRef = useRef<HTMLInputElement>(null);
-  const saveTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  
+  // Playback Timing Refs
+  const playbackStartTimeRef = useRef<number>(0);
+  const playbackOffsetRef = useRef<number>(0);
 
   // --- Helpers ---
   const getStandardDuration = useCallback(() => {
-    let multiplier = 1;
-    if (gridConfig.beatUnit === 'eighth') multiplier = 0.5;
-    if (gridConfig.beatUnit === 'dotted-quarter') multiplier = 1.5;
+    let effectiveBpm = gridConfig.bpm;
+    if (gridConfig.beatUnit === 'eighth') effectiveBpm = effectiveBpm / 2;
+    if (gridConfig.beatUnit === 'dotted-quarter') effectiveBpm = effectiveBpm * 1.5;
 
     const beats = gridConfig.tsTop * (4 / gridConfig.tsBottom);
-    return (beats * 60) / (gridConfig.bpm * (1/multiplier)); // Inverse because duration depends on pulse time
+    return (beats * 60) / effectiveBpm;
   }, [gridConfig]);
 
   const syncSelectionWithMeasures = useCallback((indices: number[]) => {
@@ -183,14 +197,15 @@ const App: React.FC = () => {
     if (start !== -1 && end !== -1) {
         const newSel = { active: true, start, end };
         setSelection(newSel);
-        setLoopState({ active: true, start, end });
-        setAudioState(prev => ({ ...prev, currentTime: start }));
+        if (!audioState.isPlaying) {
+             setAudioState(prev => ({ ...prev, currentTime: start }));
+        }
     }
-  }, [measures, gridConfig, getStandardDuration]);
+  }, [measures, gridConfig, getStandardDuration, audioState.isPlaying]);
 
 
   // --- Audio Initialization ---
-  const initAudio = async (buffer: Tone.ToneAudioBuffer) => {
+  const initAudio = async (buffer: Tone.ToneAudioBuffer, currentParams: ProcessingParams = params) => {
     if (playerRef.current) {
       playerRef.current.dispose();
       playerRef.current = null;
@@ -204,7 +219,7 @@ const App: React.FC = () => {
     player.grainSize = GRAIN_SIZE;
     player.overlap = OVERLAP;
     
-    const eq = new Tone.EQ3(params.eqLow, params.eqMid, params.eqHigh);
+    const eq = new Tone.EQ3(currentParams.eqLow, currentParams.eqMid, currentParams.eqHigh);
     const analyser = new Tone.Waveform(256);
     analyserRef.current = analyser;
 
@@ -213,11 +228,14 @@ const App: React.FC = () => {
     playerRef.current = player;
     eqRef.current = eq;
 
-    player.playbackRate = params.speed;
-    player.detune = params.pitch * 100;
-    player.volume.value = params.volume;
+    player.playbackRate = currentParams.speed;
+    player.detune = currentParams.pitch * 100;
+    player.volume.value = currentParams.volume;
 
-    Tone.Transport.bpm.value = gridConfig.bpm;
+    let effectiveBpm = gridConfig.bpm;
+    if (gridConfig.beatUnit === 'eighth') effectiveBpm = effectiveBpm / 2;
+    if (gridConfig.beatUnit === 'dotted-quarter') effectiveBpm = effectiveBpm * 1.5;
+    Tone.Transport.bpm.value = effectiveBpm;
 
     setAudioState(prev => ({
       ...prev,
@@ -229,192 +247,235 @@ const App: React.FC = () => {
     setLoadingState(LoadingState.READY);
   };
 
-  // --- Persistence & Multi-Project Logic ---
-
-  // 1. Initial Load of Projects List
-  useEffect(() => {
-      const loadProjectsList = async () => {
-          try {
-              const list = await getProjects();
-              setProjects(list);
-              
-              if (list.length > 0) {
-                  // Load the most recently opened project
-                  setActiveProjectId(list[0].id);
-              } else {
-                  // Create a default new project
-                  handleCreateProject();
-              }
-          } catch (err) {
-              console.error("Failed to load projects", err);
-              // Fallback default
-              handleCreateProject();
-          }
-      };
-      loadProjectsList();
-  }, []);
-
-  // 2. Load Project Content when ID changes
-  useEffect(() => {
-    if (!activeProjectId) return;
-
-    const restoreSession = async () => {
-      try {
-        // Cleanup previous audio context if needed
-        if (playerRef.current) {
-             playerRef.current.stop();
-             // We don't dispose context, just the nodes usually, but initAudio handles replacement
-        }
-        
-        setRestoring(true);
-        setStatusMessage('Cargando proyecto...');
-        setLoadingState(LoadingState.PROCESSING);
-
-        // Reset memory state before loading
-        setMeasures([]);
-        setMarkers([]);
-        setAudioState(prev => ({ ...prev, isLoaded: false, buffer: null, url: null }));
-
-        // A. Restore Audio
-        const savedAudio = await loadAudioFromDB(activeProjectId);
-        
-        // B. Restore State
-        const savedState = await loadStateFromDB(activeProjectId);
-
-        if (savedState) {
-          setMeasures(savedState.measures);
-          setGridConfig(savedState.gridConfig);
-          setMarkers(savedState.markers);
-          setParams(savedState.params);
-          setHistory([{
-            measures: savedState.measures,
-            gridConfig: savedState.gridConfig,
-            markers: savedState.markers
-          }]);
-          setHistoryIndex(0);
-        } else {
-            // New project default state
-             setGridConfig({
-                bpm: 120, tsTop: 4, tsBottom: 4, keySignature: 'C', offset: 0, beatUnit: 'quarter'
-            });
-            setParams({
-                speed: 1.0, pitch: 0, volume: -5, eqLow: 0, eqMid: 0, eqHigh: 0, metronomeVolume: -10
-            });
-            setHistory([]);
-            setHistoryIndex(-1);
-        }
-
-        if (savedAudio) {
-           await processFile(savedAudio.blob, savedAudio.fileName, false); 
-        } else {
-           setLoadingState(LoadingState.IDLE);
-           setStatusMessage('');
-        }
-
-        // Update Last Opened
-        const project = projects.find(p => p.id === activeProjectId);
-        if (project) {
-            await saveProjectMeta({ ...project, lastOpened: Date.now() });
-        }
-
-      } catch (err) {
-        console.error("Failed to restore session", err);
-        setLoadingState(LoadingState.IDLE);
-      } finally {
-        setRestoring(false);
-      }
-    };
-
-    restoreSession();
-  }, [activeProjectId]);
-
-  // 3. Auto-Save Effect
-  useEffect(() => {
-    if (restoring || !activeProjectId) return;
-    if (loadingState !== LoadingState.READY && loadingState !== LoadingState.IDLE) return;
-
-    if (saveTimeoutRef.current) {
-      clearTimeout(saveTimeoutRef.current);
-    }
-    
-    setSaveStatus('dirty');
-
-    saveTimeoutRef.current = setTimeout(async () => {
-       setSaveStatus('saving');
-       try {
-         await saveStateToDB({
-           measures,
-           gridConfig,
-           markers,
-           params,
-           fileName: audioState.fileName,
-           timestamp: Date.now()
-         }, activeProjectId);
-         setSaveStatus('saved');
-       } catch (err) {
-         console.error("Auto-save failed", err);
-       }
-    }, 2000); 
-
-    return () => {
-      if (saveTimeoutRef.current) clearTimeout(saveTimeoutRef.current);
-    };
-
-  }, [measures, gridConfig, markers, params, audioState.fileName, restoring, loadingState, activeProjectId]);
-
-
   // --- Project Management Functions ---
 
-  const handleCreateProject = async () => {
+  // Startup Logic
+  useEffect(() => {
+      if (projects.length === 0) {
+          setShowNewProjectModal(true);
+      }
+  }, [projects]);
+
+  // Helper: Save current tab state to memory cache
+  const saveCurrentToCache = (projectId: string) => {
+      projectCache.current[projectId] = {
+          measures,
+          gridConfig,
+          markers,
+          params,
+          history,
+          historyIndex,
+          audioBuffer: audioState.buffer,
+          audioFileName: audioState.fileName,
+          audioUrl: audioState.url,
+          audioDuration: audioState.duration
+      };
+  };
+
+  // Helper: Load tab state from memory cache
+  const loadFromCache = async (projectId: string) => {
+      const data = projectCache.current[projectId];
+      if (!data) return;
+
+      setLoadingState(LoadingState.PROCESSING);
+      setStatusMessage('Cambiando proyecto...');
+      
+      // Stop current playback
+      if (playerRef.current) {
+          playerRef.current.stop();
+          setAudioState(prev => ({ ...prev, isPlaying: false }));
+      }
+
+      setMeasures(data.measures);
+      setGridConfig(data.gridConfig);
+      setMarkers(data.markers);
+      setParams(data.params);
+      setHistory(data.history);
+      setHistoryIndex(data.historyIndex);
+
+      setAudioState(prev => ({
+          ...prev,
+          fileName: data.audioFileName,
+          url: data.audioUrl,
+          duration: data.audioDuration,
+          currentTime: 0,
+          buffer: data.audioBuffer,
+          isLoaded: !!data.audioBuffer
+      }));
+
+      // Re-initialize audio node if buffer exists
+      if (data.audioBuffer) {
+          await initAudio(data.audioBuffer, data.params);
+      } else {
+          setLoadingState(LoadingState.IDLE);
+      }
+      
+      setStatusMessage('');
+  };
+
+  const handleSwitchProject = (newProjectId: string) => {
+      if (activeProjectId === newProjectId) return;
+      
+      // Save current
+      if (activeProjectId) {
+          saveCurrentToCache(activeProjectId);
+      }
+      
+      // Set new active
+      setActiveProjectId(newProjectId);
+      
+      // Load new
+      loadFromCache(newProjectId);
+  };
+
+  const createBlankProject = () => {
       const newId = crypto.randomUUID();
       const newProject: ProjectMeta = {
           id: newId,
-          name: 'Nuevo Proyecto',
+          name: 'Proyecto Cuchá',
           lastOpened: Date.now()
       };
       
-      await saveProjectMeta(newProject);
-      setProjects(prev => [newProject, ...prev]);
+      // Initialize Cache for this new project
+      projectCache.current[newId] = {
+          measures: [],
+          gridConfig: { bpm: 120, tsTop: 4, tsBottom: 4, keySignature: 'C', offset: 0, beatUnit: 'quarter' },
+          markers: [],
+          params: { speed: 1.0, pitch: 0, volume: -5, eqLow: 0, eqMid: 0, eqHigh: 0 },
+          history: [],
+          historyIndex: -1,
+          audioBuffer: null,
+          audioFileName: '',
+          audioUrl: null,
+          audioDuration: 0
+      };
+
+      // If we are switching from another project, save that first
+      if (activeProjectId) {
+          saveCurrentToCache(activeProjectId);
+      }
+
+      setProjects(prev => [...prev, newProject]);
       setActiveProjectId(newId);
+      loadFromCache(newId);
+      setShowNewProjectModal(false);
   };
 
-  const handleCloseProject = async (e: React.MouseEvent, projectId: string) => {
-      e.stopPropagation(); // Don't switch to tab when clicking X
-      if (confirm('¿Cerrar y eliminar este proyecto permanentemente?')) {
-          await deleteProject(projectId);
-          const newProjects = projects.filter(p => p.id !== projectId);
-          setProjects(newProjects);
-          
-          if (activeProjectId === projectId) {
-              if (newProjects.length > 0) {
-                  setActiveProjectId(newProjects[0].id);
-              } else {
-                  handleCreateProject();
+  const handleImportProjectJSON = (e: React.ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0];
+      if (!file) return;
+
+      const reader = new FileReader();
+      reader.onload = async (ev) => {
+          try {
+              const data = JSON.parse(ev.target?.result as string);
+              const newId = crypto.randomUUID();
+              const newName = data.fileName || "Proyecto Importado";
+
+              const importedState: CachedProjectData = {
+                  measures: data.measures || [],
+                  gridConfig: data.gridConfig || { bpm: 120, tsTop: 4, tsBottom: 4, keySignature: 'C', offset: 0, beatUnit: 'quarter' },
+                  markers: data.markers || data.measuresMarkers || [],
+                  params: data.params || { speed: 1.0, pitch: 0, volume: -5, eqLow: 0, eqMid: 0, eqHigh: 0 },
+                  history: [], // Start with empty history for simplicity
+                  historyIndex: -1,
+                  audioBuffer: null, // Audio is NOT in JSON
+                  audioFileName: newName,
+                  audioUrl: null,
+                  audioDuration: 0
+              };
+
+              projectCache.current[newId] = importedState;
+              
+              if (activeProjectId) {
+                  saveCurrentToCache(activeProjectId);
               }
+
+              const newProjectMeta: ProjectMeta = { id: newId, name: newName, lastOpened: Date.now() };
+              setProjects(prev => [...prev, newProjectMeta]);
+              setActiveProjectId(newId);
+              loadFromCache(newId);
+              setShowNewProjectModal(false);
+
+          } catch(err) {
+              console.error(err);
+              setAlertModal({ isOpen: true, message: "Error al importar el archivo de proyecto.", onClose: () => setAlertModal(null) });
+          }
+      };
+      reader.readAsText(file);
+  };
+
+  const handleDownloadProject = () => {
+      if (!activeProjectId) return;
+      setSaveStatus('saving');
+      
+      const projectData = {
+          fileName: audioState.fileName,
+          gridConfig,
+          measures,
+          markers,
+          params
+      };
+      
+      const blob = new Blob([JSON.stringify(projectData, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${audioState.fileName || 'cucha-project'}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+
+      setTimeout(() => {
+          setSaveStatus('saved');
+      }, 500);
+  };
+
+  const performCloseProject = (projectId: string) => {
+      // Remove from cache
+      delete projectCache.current[projectId];
+      
+      const newProjects = projects.filter(p => p.id !== projectId);
+      setProjects(newProjects);
+      
+      if (activeProjectId === projectId) {
+          if (newProjects.length > 0) {
+              // Switch to the first available
+              handleSwitchProject(newProjects[0].id);
+          } else {
+              // Logic handled by useEffect -> Show Modal
+              setActiveProjectId(null);
           }
       }
+      setConfirmationModal(null);
   };
 
-  const updateProjectName = async (name: string) => {
-      if (!activeProjectId) return;
-      const updatedProjects = projects.map(p => 
-          p.id === activeProjectId ? { ...p, name: name } : p
-      );
-      setProjects(updatedProjects);
-      
-      const current = updatedProjects.find(p => p.id === activeProjectId);
-      if (current) await saveProjectMeta(current);
+  const handleCloseProject = (e: React.MouseEvent, projectId: string) => {
+      e.stopPropagation(); 
+      e.preventDefault();
+
+      setConfirmationModal({
+        isOpen: true,
+        message: '¿Cerrar este proyecto? Los cambios no guardados en archivo se perderán.',
+        onConfirm: () => performCloseProject(projectId),
+        onCancel: () => setConfirmationModal(null)
+      });
   };
+
+  // 3. DIRTY STATE CHECK 
+  useEffect(() => {
+    if (!activeProjectId) return;
+    if (loadingState !== LoadingState.READY && loadingState !== LoadingState.IDLE) return;
+    setSaveStatus('dirty');
+  }, [measures, gridConfig, markers, params, audioState.fileName]);
 
 
   // --- File Handling ---
-  const processFile = async (file: File | Blob, fileName?: string, shouldSaveToDB: boolean = true) => {
+  const processFile = async (file: File | Blob, fileName?: string) => {
     setLoadingState(LoadingState.PROCESSING);
     setStatusMessage('Decodificando audio...');
 
     try {
       const arrayBuffer = await file.arrayBuffer();
-      // Ensure context is running/exists
       if (Tone.getContext().state === 'suspended') {
           await Tone.getContext().resume();
       }
@@ -425,18 +486,19 @@ const App: React.FC = () => {
       await initAudio(toneBuffer);
       
       const name = fileName || (file as File).name || 'Audio Importado';
+      const url = URL.createObjectURL(file);
 
       setAudioState(prev => ({
         ...prev,
         fileName: name,
-        url: URL.createObjectURL(file)
+        url: url
       }));
 
-      // Update Project Name if it was generic
+      // Update name in tabs if generic
       if (activeProjectId) {
           const currentProj = projects.find(p => p.id === activeProjectId);
-          if (currentProj && (currentProj.name === 'Nuevo Proyecto' || shouldSaveToDB)) {
-              updateProjectName(name);
+          if (currentProj && currentProj.name === 'Proyecto Cuchá') {
+               setProjects(projects.map(p => p.id === activeProjectId ? { ...p, name: name } : p));
           }
       }
 
@@ -444,11 +506,8 @@ const App: React.FC = () => {
            initializeMeasures(toneBuffer.duration, gridConfig.bpm, gridConfig.tsTop, gridConfig.tsBottom);
       }
 
-      if (shouldSaveToDB && activeProjectId) {
-        setStatusMessage('Guardando en caché...');
-        await saveAudioToDB(file, name, activeProjectId);
-        setStatusMessage('');
-      }
+      setSaveStatus('dirty'); 
+      setStatusMessage('');
 
     } catch (err) {
       console.error(err);
@@ -482,7 +541,7 @@ const App: React.FC = () => {
   };
   
   const initializeMeasures = (duration: number, bpm: number, tsTop: number, tsBottom: number) => {
-      const secondsPerBeat = 60 / bpm;
+      const secondsPerBeat = 60 / bpm; 
       const secondsPerMeasure = secondsPerBeat * (tsTop * (4/tsBottom));
       const count = Math.ceil(duration / secondsPerMeasure);
       
@@ -535,6 +594,7 @@ const App: React.FC = () => {
 
   const handleCommitChanges = () => {
       addToHistory(measures, gridConfig, markers);
+      setSaveStatus('dirty');
   };
 
   // --- Playback Controls ---
@@ -547,28 +607,17 @@ const App: React.FC = () => {
 
     if (audioState.isPlaying) {
       playerRef.current.stop();
-      Tone.Transport.stop();
       setAudioState(prev => ({ ...prev, isPlaying: false }));
     } else {
-      if (loopState.active && loopState.start !== null && loopState.end !== null) {
-          playerRef.current.loop = true;
-          playerRef.current.loopStart = loopState.start;
-          playerRef.current.loopEnd = loopState.end;
-          
-          if (audioState.currentTime < loopState.start || audioState.currentTime > loopState.end) {
-               playerRef.current.start(undefined, loopState.start);
-          } else {
-               playerRef.current.start(undefined, audioState.currentTime);
-          }
-      } else {
-          playerRef.current.loop = false;
-          playerRef.current.start(undefined, audioState.currentTime);
-      }
+      playerRef.current.loop = false;
+      playerRef.current.start(undefined, audioState.currentTime);
       
-      if (isMetronomeOn) Tone.Transport.start();
+      playbackStartTimeRef.current = Tone.now();
+      playbackOffsetRef.current = audioState.currentTime;
+
       setAudioState(prev => ({ ...prev, isPlaying: true }));
     }
-  }, [audioState.isPlaying, audioState.currentTime, loopState, isMetronomeOn]);
+  }, [audioState.isPlaying, audioState.currentTime]);
 
   const handleSeek = (time: number) => {
     const newTime = Math.max(0, Math.min(time, audioState.duration));
@@ -576,6 +625,8 @@ const App: React.FC = () => {
     if (playerRef.current && audioState.isPlaying) {
         playerRef.current.stop();
         playerRef.current.start(undefined, newTime);
+        playbackStartTimeRef.current = Tone.now();
+        playbackOffsetRef.current = newTime;
     }
     
     setAudioState(prev => ({ ...prev, currentTime: newTime }));
@@ -589,11 +640,11 @@ const App: React.FC = () => {
       playerRef.current.loop = false;
       playerRef.current.start(undefined, start, duration);
       
-      setLoopState({ active: true, start: start, end: start + duration });
+      playbackStartTimeRef.current = Tone.now();
+      playbackOffsetRef.current = start;
+      
       setSelection({ active: true, start: start, end: start + duration });
       setAudioState(prev => ({ ...prev, isPlaying: true, currentTime: start }));
-      
-      if (isMetronomeOn) Tone.Transport.start();
   };
 
   // --- Duplicate Logic ---
@@ -621,6 +672,7 @@ const App: React.FC = () => {
 
       setMeasures(reindexed);
       addToHistory(reindexed, gridConfig, markers);
+      setSaveStatus('dirty');
 
       const newSelectionStart = insertPointIndex + 1;
       const newSelectionEnd = insertPointIndex + newBlock.length;
@@ -643,11 +695,12 @@ const App: React.FC = () => {
       
       if (start !== -1 && end !== -1) {
           setSelection({ active: true, start, end });
-          setLoopState({ active: true, start, end });
-          setAudioState(prev => ({ ...prev, currentTime: start }));
+          if (!audioState.isPlaying) {
+             setAudioState(prev => ({ ...prev, currentTime: start }));
+          }
       }
 
-  }, [measures, selectedMeasureIndices, gridConfig, markers, history, historyIndex, getStandardDuration]);
+  }, [measures, selectedMeasureIndices, gridConfig, markers, history, historyIndex, getStandardDuration, audioState.isPlaying]);
 
 
   // --- Keyboard Shortcuts ---
@@ -665,19 +718,21 @@ const App: React.FC = () => {
             togglePlay();
             return;
           }
-
+          if ((e.ctrlKey || e.metaKey) && e.code === 'KeyS') {
+             e.preventDefault();
+             handleDownloadProject();
+             return;
+          }
           if ((e.ctrlKey || e.metaKey) && e.code === 'KeyZ' && !e.shiftKey) {
               e.preventDefault();
               undo();
               return;
           }
-
           if ((e.ctrlKey || e.metaKey) && (e.code === 'KeyR' || (e.shiftKey && e.code === 'KeyZ'))) {
               e.preventDefault();
               redo();
               return;
           }
-
           if (e.code === 'ArrowRight' || e.code === 'ArrowLeft') {
              e.preventDefault();
              const lastSelected = selectedMeasureIndices.length > 0 
@@ -695,7 +750,6 @@ const App: React.FC = () => {
              }
              return;
           }
-
           if ((e.ctrlKey || e.metaKey) && e.code === 'KeyD') {
               e.preventDefault();
               handleDuplicateSelection();
@@ -706,7 +760,7 @@ const App: React.FC = () => {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [togglePlay, selectedMeasureIndices, measures, gridConfig, handleDuplicateSelection, syncSelectionWithMeasures, undo, redo]);
+  }, [togglePlay, selectedMeasureIndices, measures, gridConfig, handleDuplicateSelection, syncSelectionWithMeasures, undo, redo, handleDownloadProject]);
 
   // --- Fullscreen Logic ---
   useEffect(() => {
@@ -731,111 +785,265 @@ const App: React.FC = () => {
       setIsCompactMode(!isCompactMode);
   };
 
-  // --- Metronome Logic ---
-  const metronomeSynth = useRef<Tone.PolySynth | null>(null);
-  const metronomeLoop = useRef<Tone.Sequence | null>(null);
-
-  useEffect(() => {
-      metronomeSynth.current = new Tone.PolySynth(Tone.Synth, {
-          oscillator: { type: "triangle" }, 
-          envelope: { attack: 0.001, decay: 0.1, sustain: 0, release: 0.1 }
-      }).toDestination();
+  // --- MusicXML Handler ---
+  const handleExportXML = () => {
+      const fifths = keyToFifths(gridConfig.keySignature);
+      const mode = gridConfig.keySignature.endsWith('m') ? 'minor' : 'major';
       
-      metronomeSynth.current.volume.value = params.metronomeVolume;
-      
-      return () => {
-          metronomeSynth.current?.dispose();
-          metronomeLoop.current?.dispose();
-      };
-  }, []);
+      let xml = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE score-partwise PUBLIC "-//Recordare//DTD MusicXML 3.1 Partwise//EN" "http://www.musicxml.org/dtds/partwise.dtd">
+<score-partwise version="3.1">
+  <part-list>
+    <score-part id="P1">
+      <part-name>Music</part-name>
+    </score-part>
+  </part-list>
+  <part id="P1">`;
 
-  useEffect(() => {
-      if (metronomeSynth.current) {
-          metronomeSynth.current.volume.value = params.metronomeVolume;
-      }
-  }, [params.metronomeVolume]);
-
-  useEffect(() => {
-      // Internal BPM adjustment based on beat unit
-      let internalBpm = gridConfig.bpm;
-      if (gridConfig.beatUnit === 'eighth') internalBpm = internalBpm / 2;
-      if (gridConfig.beatUnit === 'dotted-quarter') internalBpm = internalBpm * 1.5;
-
-      Tone.Transport.bpm.value = internalBpm;
-      Tone.Transport.timeSignature = gridConfig.tsTop;
-  }, [gridConfig.bpm, gridConfig.tsTop, gridConfig.beatUnit]);
-
-  useEffect(() => {
-      if (metronomeLoop.current) {
-          metronomeLoop.current.dispose();
-          metronomeLoop.current = null;
-      }
-
-      if (isMetronomeOn) {
-          const accents = [];
-          for(let i=0; i<gridConfig.tsTop; i++) {
-              accents.push(i === 0 ? "G5" : "C5"); 
-          }
-          const subdivision = gridConfig.tsBottom === 8 ? "8n" : "4n";
-
-          metronomeLoop.current = new Tone.Sequence((time, note) => {
-             metronomeSynth.current?.triggerAttackRelease(note, "32n", time);
-          }, accents, subdivision);
+      measures.forEach((m, index) => {
+          xml += `
+    <measure number="${m.index}">`;
           
-          metronomeLoop.current.start(gridConfig.offset);
+          if (index === 0) {
+              xml += `
+      <attributes>
+        <divisions>1</divisions>
+        <key>
+          <fifths>${fifths}</fifths>
+          <mode>${mode}</mode>
+        </key>
+        <time>
+          <beats>${gridConfig.tsTop}</beats>
+          <beat-type>${gridConfig.tsBottom}</beat-type>
+        </time>
+        <clef>
+          <sign>G</sign>
+          <line>2</line>
+        </clef>
+      </attributes>`;
+          }
 
-          if (audioState.isPlaying) Tone.Transport.start();
+          if (m.chords.trim()) {
+              const match = m.chords.match(/^([A-G])([#b]?)(.*)$/);
+              if (match) {
+                  const rootStep = match[1];
+                  const alterSign = match[2];
+                  const kindStr = match[3];
+                  
+                  let alter = 0;
+                  if (alterSign === '#') alter = 1;
+                  if (alterSign === 'b') alter = -1;
 
-      } else {
-          if (!audioState.isPlaying) Tone.Transport.stop(); 
-      }
-  }, [isMetronomeOn, gridConfig.tsTop, gridConfig.tsBottom, gridConfig.offset, audioState.isPlaying]);
+                  let kind = 'major';
+                  if (kindStr.includes('m') && !kindStr.includes('maj')) kind = 'minor';
+                  if (kindStr.includes('7')) kind = 'dominant'; 
+                  
+                  xml += `
+      <harmony>
+        <root>
+          <root-step>${rootStep}</root-step>${alter !== 0 ? `
+          <root-alter>${alter}</root-alter>` : ''}
+        </root>
+        <kind>${kind}</kind>
+      </harmony>`;
+              }
+          }
 
+          xml += `
+      <note>
+        <rest/>
+        <duration>${gridConfig.tsTop}</duration>
+        ${m.lyrics.trim() ? `
+        <lyric>
+          <syllabic>single</syllabic>
+          <text>${m.lyrics}</text>
+        </lyric>` : ''}
+      </note>`;
+
+          xml += `
+    </measure>`;
+      });
+
+      xml += `
+  </part>
+</score-partwise>`;
+
+      const blob = new Blob([xml], { type: 'application/vnd.recordare.musicxml+xml' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${audioState.fileName || 'score'}.musicxml`;
+      a.click();
+      URL.revokeObjectURL(url);
+  };
+
+  const handleLoadXML = (e: React.ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0];
+      if (!file) return;
+      e.target.value = '';
+
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+          const text = ev.target?.result as string;
+          try {
+              const parser = new DOMParser();
+              const doc = parser.parseFromString(text, "text/xml");
+              
+              const parserError = doc.querySelector('parsererror');
+              if (parserError) throw new Error("XML Parsing Error");
+
+              const parts = doc.getElementsByTagName('part');
+              let targetPart: Element | null = null;
+              for(let i=0; i<parts.length; i++) {
+                  if (parts[i].getElementsByTagName('measure').length > 0) {
+                      targetPart = parts[i];
+                      break;
+                  }
+              }
+
+              if (!targetPart) throw new Error("No part found with measures");
+
+              const xmlMeasures = targetPart.getElementsByTagName('measure');
+              const newMeasures: Measure[] = [];
+              let currentKeySig = gridConfig.keySignature;
+              let currentTop = gridConfig.tsTop;
+              let currentBottom = gridConfig.tsBottom;
+
+              for (let i = 0; i < xmlMeasures.length; i++) {
+                  const xm = xmlMeasures[i];
+
+                  const attributes = xm.getElementsByTagName('attributes')[0];
+                  if (attributes) {
+                      const keyEl = attributes.getElementsByTagName('key')[0];
+                      if (keyEl) {
+                          const fifths = keyEl.getElementsByTagName('fifths')[0]?.textContent;
+                          const mode = keyEl.getElementsByTagName('mode')[0]?.textContent;
+                          if (fifths) {
+                             currentKeySig = fifthsToKey(parseInt(fifths), mode || 'major');
+                          }
+                      }
+                      const timeEl = attributes.getElementsByTagName('time')[0];
+                      if (timeEl) {
+                          const beats = timeEl.getElementsByTagName('beats')[0]?.textContent;
+                          const beatType = timeEl.getElementsByTagName('beat-type')[0]?.textContent;
+                          if (beats && beatType) {
+                              currentTop = parseInt(beats);
+                              currentBottom = parseInt(beatType);
+                          }
+                      }
+                  }
+
+                  let chords = '';
+                  const harmony = xm.getElementsByTagName('harmony')[0];
+                  if (harmony) {
+                      const root = harmony.getElementsByTagName('root')[0];
+                      const step = root?.getElementsByTagName('root-step')[0]?.textContent || '';
+                      const alterEl = root?.getElementsByTagName('root-alter')[0];
+                      const kind = harmony.getElementsByTagName('kind')[0]?.textContent || '';
+
+                      let alter = '';
+                      if (alterEl && alterEl.textContent) {
+                          const val = parseInt(alterEl.textContent);
+                          if (val === 1) alter = '#';
+                          if (val === -1) alter = 'b';
+                      }
+
+                      let suffix = '';
+                      if (kind === 'minor') suffix = 'm';
+                      else if (kind === 'dominant') suffix = '7';
+                      else if (kind.includes('seventh')) suffix = '7'; 
+                      else if (kind === 'diminished') suffix = 'dim';
+                      
+                      chords = `${step}${alter}${suffix}`;
+                  }
+
+                  let lyrics = '';
+                  const notes = xm.getElementsByTagName('note');
+                  for(let j=0; j<notes.length; j++) {
+                      const lyricEl = notes[j].getElementsByTagName('lyric')[0];
+                      if (lyricEl) {
+                          const textEl = lyricEl.getElementsByTagName('text')[0];
+                          if (textEl && textEl.textContent) {
+                              if (lyrics) lyrics += ' ';
+                              lyrics += textEl.textContent;
+                          }
+                      }
+                  }
+
+                  newMeasures.push({
+                      index: i + 1,
+                      chords,
+                      lyrics
+                  });
+              }
+              
+              setMeasures(newMeasures);
+              const newConfig = {
+                  ...gridConfig,
+                  keySignature: currentKeySig,
+                  tsTop: currentTop,
+                  tsBottom: currentBottom
+              };
+              setGridConfig(newConfig);
+              addToHistory(newMeasures, newConfig, markers);
+              setSaveStatus('dirty');
+
+          } catch(err) {
+              console.error(err);
+              setAlertModal({ isOpen: true, message: "Error al importar MusicXML. Asegúrate de que el formato sea válido.", onClose: () => setAlertModal(null) });
+          }
+      };
+      reader.readAsText(file);
+  };
 
   // --- Update Loop (Animation Frame) ---
   useEffect(() => {
     let rafId: number;
 
     const updateLoop = () => {
-      if (playerRef.current && audioState.isLoaded) {
-        if (audioState.isPlaying) {
-             setAudioState(prev => {
-                 let nextTime = prev.currentTime + (0.016 * params.speed); 
-                 
-                 if (loopState.active && loopState.end && nextTime >= loopState.end) {
-                     nextTime = loopState.start || 0;
-                 }
-                 
-                 if (!loopState.active && selection.active && selection.end > selection.start) {
-                     if (nextTime >= selection.end) {
-                         if (playerRef.current) playerRef.current.stop();
-                         Tone.Transport.stop();
-                         return { ...prev, isPlaying: false, currentTime: selection.start }; 
-                     }
-                 }
-
-                 if (nextTime > prev.duration) {
-                     nextTime = prev.duration; 
-                 }
-                 return { ...prev, currentTime: nextTime };
-             });
-        }
+      if (playerRef.current && audioState.isLoaded && audioState.isPlaying) {
+         const now = Tone.now();
+         const elapsed = now - playbackStartTimeRef.current;
+         const currentSpeed = playerRef.current.playbackRate;
+         
+         let nextTime = playbackOffsetRef.current + (elapsed * currentSpeed);
+         
+         if (nextTime >= audioState.duration) {
+              nextTime = audioState.duration;
+              playerRef.current.stop();
+              setAudioState(prev => ({ ...prev, isPlaying: false, currentTime: nextTime }));
+         } else if (selection.active && selection.end > selection.start && nextTime >= selection.end) {
+              playerRef.current.stop();
+              setAudioState(prev => ({ ...prev, isPlaying: false, currentTime: selection.start }));
+         } else {
+              setAudioState(prev => ({ ...prev, currentTime: nextTime }));
+         }
       }
       rafId = requestAnimationFrame(updateLoop);
     };
 
     rafId = requestAnimationFrame(updateLoop);
     return () => cancelAnimationFrame(rafId);
-  }, [audioState.isLoaded, audioState.isPlaying, params.speed, loopState, selection]);
+  }, [audioState.isLoaded, audioState.isPlaying, selection, audioState.duration]);
 
 
   // --- Param Changes ---
   const handleParamChange = (key: keyof ProcessingParams, value: number) => {
     setParams(prev => ({ ...prev, [key]: value }));
+    setSaveStatus('dirty');
     
     if (!playerRef.current || !eqRef.current) return;
 
-    if (key === 'speed') playerRef.current.playbackRate = value;
+    if (key === 'speed') {
+        if (audioState.isPlaying) {
+             const now = Tone.now();
+             const currentSpeed = playerRef.current.playbackRate; 
+             const elapsed = now - playbackStartTimeRef.current;
+             playbackOffsetRef.current = playbackOffsetRef.current + (elapsed * currentSpeed);
+             playbackStartTimeRef.current = now;
+        }
+        playerRef.current.playbackRate = value;
+    }
     if (key === 'pitch') playerRef.current.detune = value * 100;
     if (key === 'volume') playerRef.current.volume.value = value;
     
@@ -844,34 +1052,8 @@ const App: React.FC = () => {
     if (key === 'eqHigh') eqRef.current.high.value = value;
   };
 
-  const handleSetLoop = (type: 'start' | 'end' | 'clear' | 'toggle') => {
-      setLoopState(prev => {
-          let newState = { ...prev };
-          if (type === 'start') newState.start = audioState.currentTime;
-          if (type === 'end') newState.end = audioState.currentTime;
-          if (type === 'clear') { newState.start = null; newState.end = null; newState.active = false; }
-          if (type === 'toggle') newState.active = !newState.active;
-          
-          if (newState.start !== null && newState.end !== null && newState.start > newState.end) {
-              const temp = newState.start;
-              newState.start = newState.end;
-              newState.end = temp;
-          }
-          
-          if (playerRef.current) {
-              playerRef.current.loop = newState.active;
-              if (newState.start !== null) playerRef.current.loopStart = newState.start;
-              if (newState.end !== null) playerRef.current.loopEnd = newState.end;
-          }
-
-          if (newState.start !== null && newState.end !== null) {
-              setSelection({ active: newState.active, start: newState.start, end: newState.end });
-          } else {
-              setSelection(prevSel => ({ ...prevSel, active: false }));
-          }
-
-          return newState;
-      });
+  const handleUpdateSelection = (sel: RegionSelection) => {
+      setSelection(sel);
   };
 
   // --- Grid/Measure Handlers ---
@@ -883,6 +1065,7 @@ const App: React.FC = () => {
           return m;
       });
       setMeasures(newMeasures);
+      setSaveStatus('dirty');
   };
 
   const handleMeasureDurationChange = (index: number, newDuration: number) => {
@@ -893,6 +1076,7 @@ const App: React.FC = () => {
           return m;
       });
       setMeasures(newMeasures);
+      setSaveStatus('dirty');
   };
   
   const handleAddMeasures = () => {
@@ -903,6 +1087,7 @@ const App: React.FC = () => {
       }
       setMeasures(newMeasures);
       addToHistory(newMeasures, gridConfig, markers);
+      setSaveStatus('dirty');
   };
   
   const handleDeleteMeasure = (index: number) => {
@@ -911,6 +1096,7 @@ const App: React.FC = () => {
       setMeasures(newMeasures);
       setSelectedMeasureIndices(prev => prev.filter(i => i !== index));
       addToHistory(newMeasures, gridConfig, markers);
+      setSaveStatus('dirty');
   };
 
   const handleInsertMeasure = (targetIndex: number, position: 'before' | 'after') => {
@@ -926,6 +1112,7 @@ const App: React.FC = () => {
       const reindexed = newMeasures.map((m, i) => ({ ...m, index: i + 1 }));
       setMeasures(reindexed);
       addToHistory(reindexed, gridConfig, markers);
+      setSaveStatus('dirty');
   };
 
   const handleMeasureSelect = (index: number, isShift: boolean, isCtrl: boolean) => {
@@ -975,9 +1162,6 @@ const App: React.FC = () => {
       };
       
       const newMeasures = measures.map(m => {
-          if (selectedMeasureIndices.length > 0 && !selectedMeasureIndices.includes(m.index)) {
-              return m;
-          }
           return {
               ...m,
               chords: transposeChord(m.chords, semitones)
@@ -985,184 +1169,166 @@ const App: React.FC = () => {
       });
 
       let newGridConfig = { ...gridConfig };
-      if (selectedMeasureIndices.length === 0 || selectedMeasureIndices.length === measures.length) {
-          const currentRoot = gridConfig.keySignature.replace('m', '');
-          const isMinor = gridConfig.keySignature.endsWith('m');
-          
-          const newRoot = transposeNote(currentRoot, semitones);
-          newGridConfig.keySignature = newRoot + (isMinor ? 'm' : '');
-      }
+      const currentRoot = gridConfig.keySignature.replace('m', '');
+      const isMinor = gridConfig.keySignature.endsWith('m');
+      
+      const newRoot = transposeNote(currentRoot, semitones);
+      newGridConfig.keySignature = newRoot + (isMinor ? 'm' : '');
 
       setMeasures(newMeasures);
       setGridConfig(newGridConfig);
       addToHistory(newMeasures, newGridConfig, markers);
-  };
-
-  const saveProject = () => {
-      const projectData = {
-          fileName: audioState.fileName,
-          gridConfig,
-          measures,
-          measuresMarkers: markers // Backup prop
-      };
-      const blob = new Blob([JSON.stringify(projectData, null, 2)], { type: 'application/json' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `${audioState.fileName || 'escuchame'}-${Date.now()}.json`;
-      a.click();
-      URL.revokeObjectURL(url);
-  };
-
-  const loadProject = (e: React.ChangeEvent<HTMLInputElement>) => {
-      const file = e.target.files?.[0];
-      if (!file) return;
-      
-      const reader = new FileReader();
-      reader.onload = (ev) => {
-          try {
-              const data = JSON.parse(ev.target?.result as string);
-              if (data.gridConfig) setGridConfig(data.gridConfig);
-              if (data.measures) setMeasures(data.measures);
-              if (data.markers || data.measuresMarkers) setMarkers(data.markers || data.measuresMarkers);
-              addToHistory(data.measures || [], data.gridConfig || gridConfig, data.markers || []);
-          } catch(err) {
-              alert('Error al leer archivo de proyecto');
-          }
-      };
-      reader.readAsText(file);
+      setSaveStatus('dirty');
   };
   
   const handleUpdateMarkers = (newMarkers: Marker[]) => {
       setMarkers(newMarkers);
       addToHistory(measures, gridConfig, newMarkers);
-  };
-
-  const handleUpdateSelection = (sel: RegionSelection) => {
-      setSelection(sel);
-      if (sel.active) {
-          setLoopState({
-              active: true,
-              start: sel.start,
-              end: sel.end
-          });
-      }
+      setSaveStatus('dirty');
   };
 
   return (
     <div className={`flex flex-col h-screen bg-slate-950 text-slate-200 overflow-hidden font-sans selection:bg-cyan-500/30 ${isCompactMode ? 'border-2 border-slate-800' : ''}`}>
       
-      {/* Tab Bar - New */}
+      {/* 1. Top Row: Branding & Tabs */}
       {!isCompactMode && (
-      <div className="flex items-center bg-slate-950 border-b border-slate-800 px-2 pt-2 gap-1 overflow-x-auto no-scrollbar">
-          {projects.map(p => (
-              <div 
-                key={p.id}
-                onClick={() => setActiveProjectId(p.id)}
-                className={`group flex items-center gap-2 px-3 py-1.5 rounded-t-lg text-xs font-bold border-t border-r border-l cursor-pointer min-w-[120px] max-w-[200px] select-none transition-colors ${
-                    activeProjectId === p.id 
-                    ? 'bg-slate-900 border-slate-700 text-cyan-400 z-10' 
-                    : 'bg-slate-900/40 border-slate-800 text-slate-500 hover:bg-slate-900/60 hover:text-slate-400'
-                }`}
-              >
-                  <span className="truncate flex-1">{p.name}</span>
-                  <button 
-                    onClick={(e) => handleCloseProject(e, p.id)}
-                    className="opacity-0 group-hover:opacity-100 hover:text-red-400 hover:bg-slate-800 rounded p-0.5 transition-all"
-                    title="Cerrar Pestaña"
+      <div className="flex h-11 bg-slate-950 border-b border-slate-800 shrink-0 select-none">
+          {/* Branding */}
+          <div className="flex items-center gap-2 px-4 border-r border-slate-800 bg-slate-950 min-w-fit">
+            <div className="w-5 h-5 bg-gradient-to-br from-cyan-400 to-indigo-500 rounded flex items-center justify-center text-slate-900 font-bold text-[10px]">
+                C
+            </div>
+            <h1 className="font-bold text-sm tracking-tight text-slate-200 hidden md:block">Cuchá</h1>
+          </div>
+
+          {/* Tabs Area */}
+          <div className="flex-1 flex items-end px-2 gap-1 overflow-x-auto no-scrollbar">
+              {projects.map(p => (
+                  <div 
+                    key={p.id}
+                    onClick={() => handleSwitchProject(p.id)}
+                    className={`group flex items-center gap-2 px-3 py-1.5 rounded-t-lg text-xs font-bold border-t border-r border-l cursor-pointer min-w-[120px] max-w-[200px] select-none transition-all relative -mb-px h-8 ${
+                        activeProjectId === p.id 
+                        ? 'bg-slate-900 border-slate-700 text-cyan-400 z-10' 
+                        : 'bg-slate-950 border-transparent text-slate-500 hover:bg-slate-900 hover:text-slate-300'
+                    }`}
                   >
-                      ×
-                  </button>
-              </div>
-          ))}
-          <button 
-            onClick={handleCreateProject}
-            className="flex items-center justify-center w-8 h-8 rounded hover:bg-slate-800 text-slate-500 hover:text-cyan-400 transition-colors"
-            title="Nuevo Proyecto"
-          >
-              +
-          </button>
+                      <span className="truncate flex-1">{p.name}</span>
+                      <button 
+                        onClick={(e) => handleCloseProject(e, p.id)}
+                        className="flex-shrink-0 w-5 h-5 -mr-1 flex items-center justify-center rounded-full hover:bg-slate-800 hover:text-red-400 text-slate-600 transition-colors z-20 cursor-pointer pointer-events-auto opacity-0 group-hover:opacity-100"
+                        title="Cerrar Proyecto"
+                      >
+                          <svg className="pointer-events-none" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+                      </button>
+                  </div>
+              ))}
+              <button 
+                onClick={() => setShowNewProjectModal(true)}
+                className="flex items-center justify-center w-8 h-8 rounded-t hover:bg-slate-900 text-slate-500 hover:text-cyan-400 transition-colors"
+                title="Nuevo Proyecto"
+              >
+                  +
+              </button>
+          </div>
       </div>
       )}
 
-      {/* Header - Hidden in Compact Mode */}
-      {!isCompactMode && (
-      <header className="flex items-center justify-between px-6 py-2 bg-slate-900 border-b border-slate-800 shrink-0">
-        <div className="flex items-center gap-3">
-            <div className="w-8 h-8 bg-gradient-to-br from-cyan-400 to-indigo-500 rounded-lg flex items-center justify-center text-slate-900 font-bold text-lg">
-                E
-            </div>
-            <h1 className="font-bold text-lg tracking-tight text-slate-100 hidden md:block">Escuchame</h1>
-            
-            {audioState.isLoaded && (
-                <div className="ml-2 px-2 py-0.5 rounded text-[10px] font-mono tracking-wider flex items-center gap-1.5 transition-colors duration-500">
-                    {saveStatus === 'saving' && <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse"></span>}
-                    {saveStatus === 'saved' && <span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>}
-                    {saveStatus === 'dirty' && <span className="w-1.5 h-1.5 rounded-full bg-slate-500"></span>}
-                    <span className="text-slate-500">
-                        {saveStatus === 'saving' ? 'GUARDANDO...' : saveStatus === 'saved' ? 'GUARDADO' : 'MODIFICADO'}
-                    </span>
-                </div>
-            )}
-        </div>
-
-        <div className="flex items-center gap-4">
-             {loadingState === LoadingState.PROCESSING && (
-                 <span className="text-xs text-cyan-400 animate-pulse">{statusMessage}</span>
-             )}
+      {/* 2. Project Toolbar */}
+      {!isCompactMode && activeProjectId && (
+      <div className="h-14 bg-slate-900 border-b border-slate-800 flex items-center px-4 justify-between shrink-0 gap-4 select-none shadow-sm z-20">
+          {/* Left: Project Actions (Save, Audio, XML) */}
+          <div className="flex items-center gap-3 overflow-x-auto no-scrollbar">
              
-             <div className="flex gap-2">
-                 <button onClick={() => fileInputRef.current?.click()} className="px-3 py-1.5 text-xs font-bold bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded transition-colors text-slate-300">
-                    ABRIR AUDIO
+             {/* Save & Status */}
+             <div className="flex items-center gap-2 mr-2">
+                 <button 
+                    onClick={handleDownloadProject} 
+                    className="group flex items-center gap-2 px-3 py-1.5 text-xs font-bold bg-emerald-600 hover:bg-emerald-500 text-white rounded transition-colors shadow-lg shadow-emerald-900/20 border border-emerald-500/50"
+                    title="Descargar Proyecto (JSON)"
+                 >
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                    <span>Guardar proyecto</span>
                  </button>
-                 <input ref={fileInputRef} type="file" accept="audio/*" onChange={handleFileUpload} className="hidden" />
-
-                 <button onClick={() => jsonInputRef.current?.click()} className="px-3 py-1.5 text-xs font-bold bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded transition-colors text-slate-300">
-                    CARGAR JSON
-                 </button>
-                 <input ref={jsonInputRef} type="file" accept=".json" onChange={loadProject} className="hidden" />
-
-                 <button onClick={saveProject} className="px-3 py-1.5 text-xs font-bold bg-indigo-600 hover:bg-indigo-500 text-white rounded transition-colors shadow-lg shadow-indigo-500/20">
-                    EXPORTAR JSON
-                 </button>
+                 
+                 {/* Status Indicator */}
+                 <div 
+                    title={saveStatus === 'saved' ? 'Todo guardado' : saveStatus === 'saving' ? 'Guardando...' : 'Cambios sin guardar'} 
+                    className={`w-2 h-2 rounded-full transition-colors ${saveStatus === 'saved' ? 'bg-emerald-500' : saveStatus === 'saving' ? 'bg-amber-500 animate-pulse' : 'bg-slate-600'}`}
+                 ></div>
              </div>
              
-             <div className="h-6 w-[1px] bg-slate-800"></div>
+             <div className="h-6 w-[1px] bg-slate-800 shrink-0"></div>
 
-             <div className="flex gap-1">
-                 <button onClick={undo} disabled={historyIndex <= 0} className="p-1.5 text-slate-400 hover:text-white disabled:opacity-30"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6 2.3L3 13"/></svg></button>
-                 <button onClick={redo} disabled={historyIndex >= history.length - 1} className="p-1.5 text-slate-400 hover:text-white disabled:opacity-30"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 7v6h-6"/><path d="M3 17a9 9 0 0 1 9-9 9 9 0 0 1 6 2.3L21 13"/></svg></button>
+             {/* Audio & XML Inputs */}
+             <div className="flex items-center gap-1">
+                <button 
+                    onClick={() => fileInputRef.current?.click()} 
+                    className="flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-slate-300 bg-slate-800 hover:bg-slate-700 hover:text-cyan-400 rounded border border-slate-700 transition-colors"
+                    title="Cambiar archivo de audio"
+                >
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+                    <span className="whitespace-nowrap">Cambiar audio</span>
+                </button>
+                <input ref={fileInputRef} type="file" accept="audio/*" onChange={handleFileUpload} className="hidden" />
+
+                {/* Load XML */}
+                <button 
+                    onClick={() => xmlInputRef.current?.click()} 
+                    className="flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-slate-300 bg-slate-800 hover:bg-slate-700 hover:text-orange-400 rounded border border-slate-700 transition-colors"
+                    title="Importar información de partitura desde MusicXML"
+                >
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 15v4c0 1.1.9 2 2 2h14a2 2 0 0 0 2-2v-4M17 9l-5 5-5-5M12 12.8V2.5"/></svg>
+                    <span className="whitespace-nowrap">Importar información de partitura (MusicXML)</span>
+                </button>
+                <input ref={xmlInputRef} type="file" accept=".musicxml,.xml" onChange={handleLoadXML} className="hidden" />
+
+                <button 
+                    onClick={handleExportXML} 
+                    disabled={!audioState.isLoaded} 
+                    className="flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-slate-300 bg-slate-800 hover:bg-slate-700 hover:text-indigo-400 rounded border border-slate-700 transition-colors disabled:opacity-50"
+                    title="Exportar a MusicXML"
+                >
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+                    <span className="whitespace-nowrap">Guardar partitura (MusicXML)</span>
+                </button>
              </div>
+          </div>
 
+          {/* Right: View & Tools */}
+          <div className="flex items-center gap-3 ml-auto">
+             {/* Undo Redo */}
+             <div className="flex bg-slate-800 rounded border border-slate-700">
+                 <button onClick={undo} disabled={historyIndex <= 0} className="p-1.5 text-slate-400 hover:text-white disabled:opacity-30 border-r border-slate-700"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6 2.3L3 13"/></svg></button>
+                 <button onClick={redo} disabled={historyIndex >= history.length - 1} className="p-1.5 text-slate-400 hover:text-white disabled:opacity-30"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 7v6h-6"/><path d="M3 17a9 9 0 0 1 9-9 9 9 0 0 1 6 2.3L21 13"/></svg></button>
+             </div>
+             
+             {/* Tuner */}
              <button 
                 onClick={() => setShowTuner(true)}
-                className="p-2 text-slate-400 hover:text-cyan-400 transition-colors"
-                title="Afinador"
+                className="flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-slate-300 bg-slate-800 hover:bg-slate-700 hover:text-cyan-400 rounded border border-slate-700 transition-colors"
              >
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 2v20M2 12h20M4.93 4.93l14.14 14.14M4.93 19.07l14.14-14.14"/></svg>
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 2v20M2 12h20M4.93 4.93l14.14 14.14M4.93 19.07l14.14-14.14"/></svg>
+                <span className="hidden lg:inline">Afinador</span>
              </button>
 
-             <button 
-                onClick={toggleCompactMode}
-                className="p-2 text-slate-400 hover:text-white transition-colors"
-                title="Modo Ventana Flotante / Compacto"
-             >
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="9" y1="3" x2="9" y2="21"></line></svg>
-             </button>
+             <div className="h-6 w-[1px] bg-slate-800"></div>
 
-             <button 
-                onClick={toggleFullscreen}
-                className="p-2 text-slate-400 hover:text-white transition-colors"
-                title={isFullscreen ? "Salir de Pantalla Completa" : "Pantalla Completa"}
-             >
-                {isFullscreen ? (
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3m0 18v-3a2 2 0 0 1 2-2h3M3 16h3a2 2 0 0 1 2 2v3"/></svg>
-                ) : (
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
-                )}
-             </button>
-        </div>
-      </header>
+             {/* Window Controls */}
+             <div className="flex gap-1">
+                 <button onClick={toggleCompactMode} className="p-1.5 text-slate-500 hover:text-white transition-colors" title="Modo Compacto">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="9" y1="3" x2="9" y2="21"></line></svg>
+                 </button>
+                 <button onClick={toggleFullscreen} className="p-1.5 text-slate-500 hover:text-white transition-colors" title="Pantalla Completa">
+                    {isFullscreen ? (
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3m0 18v-3a2 2 0 0 1 2-2h3M3 16h3a2 2 0 0 1 2 2v3"/></svg>
+                    ) : (
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+                    )}
+                 </button>
+             </div>
+          </div>
+      </div>
       )}
 
       {/* Floating Restore Button for Compact Mode */}
@@ -1215,8 +1381,6 @@ const App: React.FC = () => {
                     onSeek={handleSeek}
                     onAddMeasures={handleAddMeasures}
                     onPlayRegion={handlePlayRegion}
-                    onToggleMetronome={() => setIsMetronomeOn(!isMetronomeOn)}
-                    isMetronomeOn={isMetronomeOn}
                     onDeleteMeasure={handleDeleteMeasure}
                     onInsertMeasure={handleInsertMeasure}
                     onDuplicateSelection={handleDuplicateSelection}
@@ -1231,12 +1395,10 @@ const App: React.FC = () => {
                 <Controls 
                     params={params} 
                     audioState={audioState} 
-                    loopState={loopState}
                     onParamChange={handleParamChange} 
                     onTogglePlay={togglePlay}
                     onSeek={handleSeek}
                     onJump={(delta) => handleSeek(audioState.currentTime + delta)}
-                    onSetLoop={handleSetLoop}
                 />
             </div>
          </>
@@ -1247,22 +1409,27 @@ const App: React.FC = () => {
             onDragLeave={handleDragLeave}
             onDrop={handleDrop}
         >
-             <div className="w-24 h-24 mb-6 rounded-full bg-slate-900 border-2 border-dashed border-slate-700 flex items-center justify-center pointer-events-none">
-                 <svg className="w-10 h-10 text-slate-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zM9 10l12-3"/></svg>
-             </div>
-             
-             {loadingState === LoadingState.PROCESSING ? (
-                 <div className="flex flex-col items-center">
-                    <div className="w-8 h-8 border-4 border-cyan-500 border-t-transparent rounded-full animate-spin mb-4"></div>
-                    <p className="text-lg font-medium text-cyan-400 animate-pulse">{statusMessage}</p>
-                 </div>
-             ) : (
+             {/* Only show Drop Zone if we have a project but no audio */}
+             {activeProjectId && (
                  <>
-                    <p className="text-lg font-medium text-slate-400 mb-2 pointer-events-none">Comienza tu transcripción</p>
-                    <p className="text-sm mb-6 pointer-events-none text-center max-w-sm">Arrastra y suelta un archivo aquí para este proyecto.</p>
-                    <button onClick={() => fileInputRef.current?.click()} className="px-6 py-3 bg-cyan-600 hover:bg-cyan-500 text-white font-bold rounded-lg shadow-lg shadow-cyan-600/20 transition-all transform hover:scale-105 z-10">
-                        Seleccionar Archivo de Audio
-                    </button>
+                    <div className="w-24 h-24 mb-6 rounded-full bg-slate-900 border-2 border-dashed border-slate-700 flex items-center justify-center pointer-events-none">
+                        <svg className="w-10 h-10 text-slate-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zM9 10l12-3"/></svg>
+                    </div>
+                    
+                    {loadingState === LoadingState.PROCESSING ? (
+                        <div className="flex flex-col items-center">
+                            <div className="w-8 h-8 border-4 border-cyan-500 border-t-transparent rounded-full animate-spin mb-4"></div>
+                            <p className="text-lg font-medium text-cyan-400 animate-pulse">{statusMessage}</p>
+                        </div>
+                    ) : (
+                        <>
+                            <p className="text-lg font-medium text-slate-400 mb-2 pointer-events-none">Falta el Audio</p>
+                            <p className="text-sm mb-6 pointer-events-none text-center max-w-sm">Arrastra y suelta el archivo de audio para este proyecto.</p>
+                            <button onClick={() => fileInputRef.current?.click()} className="px-6 py-3 bg-cyan-600 hover:bg-cyan-500 text-white font-bold rounded-lg shadow-lg shadow-cyan-600/20 transition-all transform hover:scale-105 z-10">
+                                Seleccionar Archivo
+                            </button>
+                        </>
+                    )}
                  </>
              )}
         </div>
@@ -1271,6 +1438,72 @@ const App: React.FC = () => {
       {/* Overlays */}
       {showTuner && <GuitarTuner onClose={() => setShowTuner(false)} />}
       
+      {/* Confirmation Modal */}
+      {confirmationModal && (
+        <ConfirmationModal 
+            isOpen={confirmationModal.isOpen} 
+            message={confirmationModal.message} 
+            onConfirm={confirmationModal.onConfirm} 
+            onCancel={confirmationModal.onCancel} 
+        />
+      )}
+
+      {/* Alert Modal */}
+      {alertModal && (
+          <AlertModal
+            isOpen={alertModal.isOpen}
+            message={alertModal.message}
+            onClose={alertModal.onClose}
+          />
+      )}
+
+      {/* NEW PROJECT MODAL */}
+      {showNewProjectModal && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/90 backdrop-blur-md">
+              <div className="bg-slate-900 border border-slate-700 rounded-xl shadow-2xl p-8 w-full max-w-lg">
+                  <div className="flex justify-between items-center mb-8">
+                      <div className="flex flex-col">
+                          <h2 className="text-2xl font-bold text-white tracking-tight">Cuchá</h2>
+                          <p className="text-slate-500 text-sm">Espacio de trabajo para transcripción musical</p>
+                      </div>
+                      {/* Allow closing ONLY if there are projects already */}
+                      {projects.length > 0 && (
+                          <button onClick={() => setShowNewProjectModal(false)} className="text-slate-500 hover:text-white">
+                            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+                          </button>
+                      )}
+                  </div>
+                  
+                  <div className="grid grid-cols-2 gap-6">
+                      <button 
+                        onClick={createBlankProject}
+                        className="flex flex-col items-center justify-center p-8 bg-slate-800 hover:bg-slate-700 border border-slate-700 hover:border-cyan-500/50 rounded-xl transition-all group shadow-lg"
+                      >
+                          <div className="w-12 h-12 mb-4 bg-slate-900 rounded-full flex items-center justify-center group-hover:bg-cyan-900/30 transition-colors">
+                              <span className="text-2xl font-bold text-cyan-500">+</span>
+                          </div>
+                          <span className="font-bold text-lg text-slate-200">Nuevo Proyecto</span>
+                          <span className="text-xs text-slate-500 mt-2">Lienzo en blanco</span>
+                      </button>
+
+                      <button 
+                        onClick={() => jsonInputRef.current?.click()}
+                        className="flex flex-col items-center justify-center p-8 bg-slate-800 hover:bg-slate-700 border border-slate-700 hover:border-indigo-500/50 rounded-xl transition-all group shadow-lg"
+                      >
+                           <div className="w-12 h-12 mb-4 bg-slate-900 rounded-full flex items-center justify-center group-hover:bg-indigo-900/30 transition-colors">
+                              <svg width="24" height="24" className="text-indigo-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                          </div>
+                          <span className="font-bold text-lg text-slate-200">Abrir Proyecto</span>
+                          <span className="text-xs text-slate-500 mt-2">Cargar archivo .JSON</span>
+                      </button>
+                      
+                      {/* Hidden Input for Modal Action */}
+                      <input ref={jsonInputRef} type="file" accept=".json" onChange={handleImportProjectJSON} className="hidden" />
+                  </div>
+              </div>
+          </div>
+      )}
+
     </div>
   );
 };

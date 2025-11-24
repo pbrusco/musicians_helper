@@ -1,6 +1,9 @@
+
+
 import React, { useEffect, useRef, useState } from 'react';
 import * as Tone from 'tone';
 import { GridConfig, Measure, Marker, RegionSelection } from '../types';
+import { RenameModal } from './Modals';
 
 interface WaveformTimelineProps {
   buffer: Tone.ToneAudioBuffer | null;
@@ -54,11 +57,17 @@ export const WaveformTimeline: React.FC<WaveformTimelineProps> = ({
   const [selectionStart, setSelectionStart] = useState<number>(0);
 
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
+  const [renameModal, setRenameModal] = useState<{ isOpen: boolean; markerId: string; initialValue: string } | null>(null);
 
   // Helper to get standard duration
   const getStandardDuration = () => {
+      // Effective BPM logic same as App.tsx
+      let effectiveBpm = gridConfig.bpm;
+      if (gridConfig.beatUnit === 'eighth') effectiveBpm = effectiveBpm / 2;
+      if (gridConfig.beatUnit === 'dotted-quarter') effectiveBpm = effectiveBpm * 1.5;
+
       const beats = gridConfig.tsTop * (4 / gridConfig.tsBottom);
-      return (beats * 60) / gridConfig.bpm;
+      return (beats * 60) / effectiveBpm;
   };
 
   // Auto Scroll Logic - Updated to only scroll if out of view
@@ -467,15 +476,17 @@ export const WaveformTimeline: React.FC<WaveformTimelineProps> = ({
       const marker = markers.find(m => m.id === id);
       if (!marker) return;
       
-      // Use prompt safely
-      // We close context menu AFTER processing
-      const newLabel = prompt("Nombre de la marca:", marker.label);
-      if (newLabel !== null) {
-          const updated = markers.map(m => m.id === id ? { ...m, label: newLabel } : m);
-          onUpdateMarkers(updated);
-      }
+      setRenameModal({ isOpen: true, markerId: id, initialValue: marker.label });
       setContextMenu(null);
   };
+
+  const performRename = (newLabel: string) => {
+      if (renameModal) {
+          const updated = markers.map(m => m.id === renameModal.markerId ? { ...m, label: newLabel } : m);
+          onUpdateMarkers(updated);
+      }
+      setRenameModal(null);
+  }
 
   return (
     <div className="flex flex-col border-b border-slate-800 bg-slate-900 relative">
@@ -548,6 +559,16 @@ export const WaveformTimeline: React.FC<WaveformTimelineProps> = ({
                     )}
                 </div>
             </>
+        )}
+
+        {renameModal && (
+            <RenameModal 
+                isOpen={renameModal.isOpen}
+                title="Renombrar Marca"
+                initialValue={renameModal.initialValue}
+                onSave={performRename}
+                onCancel={() => setRenameModal(null)}
+            />
         )}
     </div>
   );

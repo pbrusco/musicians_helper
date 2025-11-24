@@ -1,28 +1,24 @@
 
 import React, { useState } from 'react';
 import { MAX_PITCH_SEMITONES, MIN_PITCH_SEMITONES, MAX_SPEED, MIN_SPEED } from '../constants';
-import { AudioState, ProcessingParams, LoopState } from '../types';
+import { AudioState, ProcessingParams } from '../types';
 
 interface ControlsProps {
   params: ProcessingParams;
   audioState: AudioState;
-  loopState: LoopState;
   onParamChange: (key: keyof ProcessingParams, value: number) => void;
   onTogglePlay: () => void;
   onSeek: (time: number) => void;
   onJump: (delta: number) => void;
-  onSetLoop: (type: 'start' | 'end' | 'clear' | 'toggle') => void;
 }
 
 export const Controls: React.FC<ControlsProps> = ({ 
   params, 
   audioState, 
-  loopState,
   onParamChange, 
   onTogglePlay,
   onSeek,
-  onJump,
-  onSetLoop
+  onJump
 }) => {
   
   const [showEQ, setShowEQ] = useState(false);
@@ -53,16 +49,6 @@ export const Controls: React.FC<ControlsProps> = ({
              <span>{formatTime(audioState.duration)}</span>
           </div>
           <div className="relative h-4 flex items-center">
-            {/* Loop bar */}
-            {loopState.start !== null && loopState.end !== null && (
-               <div 
-                 className="absolute top-0 h-1 bg-green-500/50 rounded z-0 pointer-events-none"
-                 style={{
-                   left: `${(loopState.start / audioState.duration) * 100}%`,
-                   width: `${((loopState.end - loopState.start) / audioState.duration) * 100}%`
-                 }}
-               />
-            )}
             <input
               type="range"
               min={0}
@@ -142,21 +128,8 @@ export const Controls: React.FC<ControlsProps> = ({
 
        <div className="h-8 w-[1px] bg-slate-800 hidden md:block"></div>
 
-      {/* 4. Loop & FX Buttons */}
+      {/* 4. FX Buttons */}
       <div className="flex items-center gap-2">
-         <div className="flex flex-col gap-1">
-            <div className="flex gap-1">
-                <button onClick={() => onSetLoop('start')} className={`text-[9px] px-1.5 rounded border ${loopState.start !== null ? 'text-green-400 border-green-900 bg-green-900/10' : 'text-slate-500 border-slate-700'}`}>IN</button>
-                <button onClick={() => onSetLoop('end')} className={`text-[9px] px-1.5 rounded border ${loopState.end !== null ? 'text-green-400 border-green-900 bg-green-900/10' : 'text-slate-500 border-slate-700'}`}>OUT</button>
-            </div>
-            <button 
-                onClick={() => onSetLoop('toggle')}
-                className={`text-[9px] px-2 rounded border w-full ${loopState.active ? 'bg-green-600 text-white border-green-600' : 'bg-slate-800 text-slate-500 border-slate-700'}`}
-            >
-                LOOP
-            </button>
-         </div>
-
          {/* Volume */}
           <div className="flex flex-col items-center ml-2">
              <input
@@ -206,18 +179,6 @@ export const Controls: React.FC<ControlsProps> = ({
                                 <span className="text-[9px] text-slate-500 mt-2">{b.label}</span>
                             </div>
                         ))}
-                     </div>
-                     <div className="mt-4 pt-2 border-t border-slate-800">
-                        <div className="flex justify-between text-[10px] text-indigo-400 mb-1">
-                            <span>Metrónomo</span>
-                            <span>{params.metronomeVolume.toFixed(0)} dB</span>
-                        </div>
-                        <input
-                            type="range" min={-60} max={0}
-                            value={params.metronomeVolume}
-                            onChange={(e) => onParamChange('metronomeVolume', parseFloat(e.target.value))}
-                            className="w-full h-1 bg-slate-700 rounded-lg appearance-none cursor-pointer"
-                        />
                      </div>
                  </div>
              )}

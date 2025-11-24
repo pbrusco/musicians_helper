@@ -1,7 +1,6 @@
 
-
 import React, { useState, useRef, useEffect } from 'react';
-import { GridConfig, Measure, AudioState } from '../types';
+import { GridConfig, Measure, AudioState, BeatUnit } from '../types';
 
 interface MeasureGridProps {
   measures: Measure[];
@@ -16,8 +15,6 @@ interface MeasureGridProps {
   onSeek: (time: number) => void;
   onAddMeasures: () => void;
   onPlayRegion: (start: number, duration: number) => void;
-  onToggleMetronome: () => void;
-  isMetronomeOn: boolean;
   onDeleteMeasure: (index: number) => void;
   onInsertMeasure: (index: number, position: 'before' | 'after') => void;
   onDuplicateSelection: () => void;
@@ -39,8 +36,6 @@ export const MeasureGrid: React.FC<MeasureGridProps> = ({
   onSeek,
   onAddMeasures,
   onPlayRegion,
-  onToggleMetronome,
-  isMetronomeOn,
   onDeleteMeasure,
   onInsertMeasure,
   onDuplicateSelection,
@@ -53,8 +48,13 @@ export const MeasureGrid: React.FC<MeasureGridProps> = ({
   const gridContainerRef = useRef<HTMLDivElement>(null);
 
   const getStandardDuration = () => {
+      // Calculate effective BPM relative to quarter notes
+      let effectiveBpm = gridConfig.bpm;
+      if (gridConfig.beatUnit === 'eighth') effectiveBpm = effectiveBpm / 2;
+      if (gridConfig.beatUnit === 'dotted-quarter') effectiveBpm = effectiveBpm * 1.5;
+
       const beats = gridConfig.tsTop * (4 / gridConfig.tsBottom);
-      return (beats * 60) / gridConfig.bpm;
+      return (beats * 60) / effectiveBpm;
   };
 
   // Pre-calculate all measure start times and durations
@@ -86,6 +86,24 @@ export const MeasureGrid: React.FC<MeasureGridProps> = ({
       }
   }, [playingMeasureIndex, autoScroll]);
 
+  // Helper to toggle beat unit
+  const toggleBeatUnit = (e: React.MouseEvent) => {
+      e.stopPropagation();
+      const units: BeatUnit[] = ['quarter', 'eighth', 'dotted-quarter'];
+      const currentIndex = units.indexOf(gridConfig.beatUnit || 'quarter');
+      const nextIndex = (currentIndex + 1) % units.length;
+      onConfigChange({ ...gridConfig, beatUnit: units[nextIndex] });
+      onCommitChanges();
+  };
+
+  const getBeatUnitIcon = () => {
+      switch(gridConfig.beatUnit) {
+          case 'eighth': return '♪';
+          case 'dotted-quarter': return '♩.';
+          case 'quarter': default: return '♩';
+      }
+  };
+
   return (
     <div className="flex flex-col h-full bg-slate-950" onClick={() => setActiveMenu(null)}>
       
@@ -93,14 +111,24 @@ export const MeasureGrid: React.FC<MeasureGridProps> = ({
       <div className="flex flex-wrap items-center gap-4 px-4 py-2 bg-slate-900 border-b border-slate-800 sticky top-0 z-20 shadow-md h-14 shrink-0">
         
         <div className="flex flex-col">
-          <label className="text-[9px] text-slate-500 font-bold uppercase">BPM</label>
-          <input 
-            type="number" 
-            value={gridConfig.bpm}
-            onChange={(e) => onConfigChange({...gridConfig, bpm: parseFloat(e.target.value) || 120})}
-            onBlur={onCommitChanges}
-            className="w-14 bg-slate-800 border border-slate-700 rounded px-2 py-0.5 text-xs font-mono text-cyan-400 focus:border-cyan-500 focus:outline-none"
-          />
+          <label className="text-[9px] text-slate-500 font-bold uppercase">Tempo</label>
+          <div className="flex items-center gap-1">
+              <button 
+                onClick={toggleBeatUnit}
+                className="w-8 h-6 flex items-center justify-center bg-slate-800 border border-slate-700 rounded text-sm hover:bg-slate-700 text-cyan-400 font-bold"
+                title="Cambiar figura de pulso"
+              >
+                  {getBeatUnitIcon()}
+              </button>
+              <span className="text-slate-500 text-xs font-bold">=</span>
+              <input 
+                type="number" 
+                value={gridConfig.bpm}
+                onChange={(e) => onConfigChange({...gridConfig, bpm: parseFloat(e.target.value) || 120})}
+                onBlur={onCommitChanges}
+                className="w-14 bg-slate-800 border border-slate-700 rounded px-2 py-0.5 text-xs font-mono text-cyan-400 focus:border-cyan-500 focus:outline-none"
+              />
+          </div>
         </div>
 
         <div className="flex flex-col">
@@ -138,7 +166,7 @@ export const MeasureGrid: React.FC<MeasureGridProps> = ({
 
         {/* Transpose Controls */}
         <div className="flex flex-col">
-             <label className="text-[9px] text-slate-500 font-bold uppercase mb-0.5">Transponer {selectedMeasureIndices.length > 0 ? '(Selección)' : '(Todo)'}</label>
+             <label className="text-[9px] text-slate-500 font-bold uppercase mb-0.5">Transponer</label>
              <div className="flex gap-1">
                 <button onClick={(e) => { e.stopPropagation(); onTranspose(-1); }} className="px-2 py-0.5 bg-slate-800 border border-slate-700 text-slate-300 rounded text-xs hover:bg-slate-700 font-mono">-1</button>
                 <button onClick={(e) => { e.stopPropagation(); onTranspose(1); }} className="px-2 py-0.5 bg-slate-800 border border-slate-700 text-slate-300 rounded text-xs hover:bg-slate-700 font-mono">+1</button>
@@ -148,16 +176,6 @@ export const MeasureGrid: React.FC<MeasureGridProps> = ({
         <div className="flex-1"></div>
 
         <div className="flex gap-2">
-             <button 
-                onClick={(e) => { e.stopPropagation(); onToggleMetronome(); }}
-                className={`flex items-center gap-2 px-3 py-1 rounded text-xs border transition-colors ${
-                    isMetronomeOn 
-                    ? 'bg-indigo-600 border-indigo-500 text-white' 
-                    : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-slate-300'
-                }`}
-            >
-                ● Metro
-            </button>
             <button 
                 onClick={(e) => { e.stopPropagation(); onToggleAutoScroll(); }}
                 className={`flex items-center gap-2 px-3 py-1 rounded text-xs border transition-colors ${

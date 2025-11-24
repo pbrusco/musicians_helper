@@ -20,13 +20,6 @@ export interface ProcessingParams {
   eqLow: number; 
   eqMid: number; 
   eqHigh: number;
-  metronomeVolume: number; // Decibels (-60 to 0 or +)
-}
-
-export interface LoopState {
-  active: boolean;
-  start: number | null;
-  end: number | null;
 }
 
 export interface RegionSelection {

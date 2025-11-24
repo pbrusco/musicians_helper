@@ -1,6 +1,6 @@
 {
-  "name": "Escuchame",
-  "description": "Una herramienta de procesamiento de audio avanzada para extracción, time-stretching y pitch-shifting independiente.",
+  "name": "Cuchá",
+  "description": "Una herramienta para escucha profunda de audio y su rápida edición.",
   "requestFramePermissions": [
     "microphone"
   ]
