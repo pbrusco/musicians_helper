@@ -1,4 +1,5 @@
 
+
 import * as Tone from 'tone';
 
 export interface AudioState {
@@ -28,6 +29,12 @@ export interface LoopState {
   end: number | null;
 }
 
+export interface RegionSelection {
+  active: boolean;
+  start: number;
+  end: number;
+}
+
 export interface Measure {
   index: number; // 1-based index
   chords: string;
@@ -35,11 +42,28 @@ export interface Measure {
   duration?: number; // Optional: specific duration in seconds. If undefined, calculated from Global BPM.
 }
 
+export interface Marker {
+  id: string;
+  time: number;
+  label: string;
+  color?: string;
+}
+
+export type BeatUnit = 'quarter' | 'eighth' | 'dotted-quarter';
+
 export interface GridConfig {
   bpm: number;
   tsTop: number;    // Global Time Signature Numerator
   tsBottom: number; // Global Time Signature Denominator
+  keySignature: string; // e.g. "C", "Am", "F#"
   offset: number;   // Start time of the first measure in seconds
+  beatUnit: BeatUnit; // The unit that the BPM refers to
+}
+
+export interface ProjectMeta {
+  id: string;
+  name: string;
+  lastOpened: number;
 }
 
 export enum LoadingState {

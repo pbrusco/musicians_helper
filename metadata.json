@@ -1,5 +1,5 @@
 {
-  "name": "Transcribime",
+  "name": "Escuchame",
   "description": "Una herramienta de procesamiento de audio avanzada para extracción, time-stretching y pitch-shifting independiente.",
   "requestFramePermissions": [
     "microphone"
