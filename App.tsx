@@ -150,7 +150,6 @@ const App: React.FC = () => {
   // --- Refs ---
   const playerRef = useRef<GrainPlayerType | null>(null);
   const eqRef = useRef<Tone.EQ3 | null>(null);
-  const analyserRef = useRef<Tone.Waveform | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const jsonInputRef = useRef<HTMLInputElement>(null);
   const xmlInputRef = useRef<HTMLInputElement>(null);
@@ -220,10 +219,9 @@ const App: React.FC = () => {
     player.overlap = OVERLAP;
     
     const eq = new Tone.EQ3(currentParams.eqLow, currentParams.eqMid, currentParams.eqHigh);
-    const analyser = new Tone.Waveform(256);
-    analyserRef.current = analyser;
-
-    player.chain(eq, analyser, Tone.Destination);
+    
+    // Connected directly to destination, removing unused analyser
+    player.chain(eq, Tone.Destination);
 
     playerRef.current = player;
     eqRef.current = eq;
